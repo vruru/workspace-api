@@ -66,6 +66,8 @@ func main() {
 	mux.HandleFunc("/api/exec", withAuth(handleExec))
 	mux.HandleFunc("/api/glob", withAuth(handleGlob))
 	mux.HandleFunc("/api/grep", withAuth(handleGrep))
+	mux.HandleFunc("/api/edit-lines", withAuth(handleEditLines))
+	mux.HandleFunc("/api/patch", withAuth(handlePatch))
 	mux.HandleFunc("/api/ping", handlePing)
 
 	certManager := autocert.Manager{
@@ -146,8 +148,9 @@ func handlePing(w http.ResponseWriter, r *http.Request) {
 func handleRead(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path   string `json:"path"`
-		Offset int    `json:"offset"`
-		Limit  int    `json:"limit"`
+		Offset   int    `json:"offset"`
+		Limit    int    `json:"limit"`
+		Numbered bool   `json:"numbered"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, 400, "Invalid JSON: "+err.Error())
@@ -175,10 +178,25 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 		lines = lines[:req.Limit]
 	}
 
+	startLine := req.Offset + 1
+	if req.Offset <= 0 {
+		startLine = 1
+	}
+
+	output := strings.Join(lines, "\n")
+	if req.Numbered {
+		var numbered []string
+		for i, line := range lines {
+			numbered = append(numbered, fmt.Sprintf("%4d | %s", startLine+i, line))
+		}
+		output = strings.Join(numbered, "\n")
+	}
+
 	jsonOK(w, map[string]interface{}{
-		"content":     strings.Join(lines, "\n"),
+		"content":     output,
 		"total_lines": totalLines,
 		"size":        len(data),
+		"start_line":  startLine,
 	})
 }
 
@@ -259,6 +277,144 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"replacements": count})
 }
 
+func handleEditLines(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path    string `json:"path"`
+		Action  string `json:"action"`
+		Start   int    `json:"start"`
+		End     int    `json:"end"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.Path == "" {
+		jsonError(w, 400, "path is required")
+		return
+	}
+	if req.Action == "" {
+		jsonError(w, 400, "action is required (delete, insert, replace)")
+		return
+	}
+	if req.Start < 1 {
+		jsonError(w, 400, "start must be >= 1")
+		return
+	}
+	if req.End < 1 {
+		req.End = req.Start
+	}
+
+	data, err := os.ReadFile(req.Path)
+	if err != nil {
+		jsonError(w, 404, "Read failed: "+err.Error())
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	totalLines := len(lines)
+
+	if req.Start > totalLines {
+		jsonError(w, 400, fmt.Sprintf("start %d exceeds total lines %d", req.Start, totalLines))
+		return
+	}
+	if req.End > totalLines {
+		req.End = totalLines
+	}
+
+	var result []string
+	var info string
+
+	switch req.Action {
+	case "delete":
+		result = append(result, lines[:req.Start-1]...)
+		result = append(result, lines[req.End:]...)
+		info = fmt.Sprintf("deleted lines %d-%d (%d lines)", req.Start, req.End, req.End-req.Start+1)
+	case "insert":
+		newLines := strings.Split(req.Content, "\n")
+		result = append(result, lines[:req.Start-1]...)
+		result = append(result, newLines...)
+		result = append(result, lines[req.Start-1:]...)
+		info = fmt.Sprintf("inserted %d lines at line %d", len(newLines), req.Start)
+	case "replace":
+		newLines := strings.Split(req.Content, "\n")
+		result = append(result, lines[:req.Start-1]...)
+		result = append(result, newLines...)
+		result = append(result, lines[req.End:]...)
+		info = fmt.Sprintf("replaced lines %d-%d with %d lines", req.Start, req.End, len(newLines))
+	default:
+		jsonError(w, 400, "action must be delete, insert, or replace")
+		return
+	}
+
+	if err := os.WriteFile(req.Path, []byte(strings.Join(result, "\n")), 0644); err != nil {
+		jsonError(w, 500, "Write failed: "+err.Error())
+		return
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"info":        info,
+		"old_lines":   totalLines,
+		"new_lines":   len(result),
+	})
+}
+
+func handlePatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path  string `json:"path"`
+		Edits []struct {
+			OldString string `json:"old_string"`
+			NewString string `json:"new_string"`
+		} `json:"edits"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.Path == "" {
+		jsonError(w, 400, "path is required")
+		return
+	}
+	if len(req.Edits) == 0 {
+		jsonError(w, 400, "edits array is required")
+		return
+	}
+
+	data, err := os.ReadFile(req.Path)
+	if err != nil {
+		jsonError(w, 404, "Read failed: "+err.Error())
+		return
+	}
+
+	content := string(data)
+	applied := 0
+
+	for i, edit := range req.Edits {
+		if edit.OldString == "" {
+			jsonError(w, 400, fmt.Sprintf("edit %d: old_string is empty", i))
+			return
+		}
+		count := strings.Count(content, edit.OldString)
+		if count == 0 {
+			jsonError(w, 400, fmt.Sprintf("edit %d: old_string not found", i))
+			return
+		}
+		if count > 1 {
+			jsonError(w, 400, fmt.Sprintf("edit %d: old_string found %d times, not unique", i, count))
+			return
+		}
+		content = strings.Replace(content, edit.OldString, edit.NewString, 1)
+		applied++
+	}
+
+	if err := os.WriteFile(req.Path, []byte(content), 0644); err != nil {
+		jsonError(w, 500, "Write failed: "+err.Error())
+		return
+	}
+
+	jsonOK(w, map[string]interface{}{"edits_applied": applied})
+}
+
 func handleExec(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Command string `json:"command"`
@@ -293,10 +449,18 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 		"GOPATH=/root/go",
 	)
 
-	output, err := cmd.CombinedOutput()
+	var stdoutBuf, stderrBuf strings.Builder
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
 	exitCode := 0
+	timedOut := false
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		if ctx.Err() == context.DeadlineExceeded {
+			timedOut = true
+			exitCode = 124
+		} else if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
 			jsonError(w, 500, "Exec failed: "+err.Error())
@@ -304,9 +468,14 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Combined output for backward compat, plus separate stdout/stderr
+	combined := stdoutBuf.String() + stderrBuf.String()
 	jsonOK(w, map[string]interface{}{
-		"output":    string(output),
+		"output":    combined,
+		"stdout":    stdoutBuf.String(),
+		"stderr":    stderrBuf.String(),
 		"exit_code": exitCode,
+		"timed_out": timedOut,
 	})
 }
 

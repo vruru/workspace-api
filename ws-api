@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""
+ws-api - Remote workspace feels like local. Zero shell escaping issues.
+All data: json.dumps() -> HTTPS -> json.loads(), never through shell parsing.
+
+== Transparent exec (just prefix ws-api, like running locally) ==
+  ws-api ls -la /root/workspace
+  ws-api git status
+  ws-api go build ./...
+  ws-api cat /etc/hostname
+  ws-api docker ps
+
+== File operations ==
+  ws-api read <path> [-n] [--offset N] [--limit N]
+  ws-api write <path> < file                         # stdin
+  ws-api write <path> --content "text"               # inline
+  ws-api write <path> --file local.txt               # from local file
+
+== Text editing (find & replace, no escaping issues via stdin JSON) ==
+  ws-api edit <path> --old "old" --new "new" [--all]
+  ws-api edit <path> --old-file old.txt --new-file new.txt
+  echo '{"old":"...","new":"..."}' | ws-api edit <path>
+
+== Line-based editing (by line numbers) ==
+  ws-api edit-lines <path> --delete 10-20
+  ws-api edit-lines <path> --insert 15 < content
+  ws-api edit-lines <path> --insert 15 --content "new line"
+  ws-api edit-lines <path> --replace 10-20 < content
+
+== Batch editing (multiple replacements in one call) ==
+  echo '[{"old":"x","new":"y"},{"old":"a","new":"b"}]' | ws-api patch <path>
+
+== Search ==
+  ws-api glob "*.go" [--path /root/workspace]
+  ws-api grep "pattern" [--path /root/workspace] [--glob "*.go"] [--context 2]
+
+== Explicit exec (with options) ==
+  ws-api exec "command" [--dir /path] [--timeout 60]
+
+== Other ==
+  ws-api ping
+  ws-api raw <endpoint> < json_body
+  ws-api help
+"""
+import json
+import shlex
+import sys
+import urllib.request
+import urllib.error
+
+API_BASE = "https://hcwkapi.bygsoga.cc"
+AUTH_TOKEN = "capy-workspace-7f3a9b2e"
+
+def api_call(endpoint, data):
+    url = f"{API_BASE}/api/{endpoint}"
+    payload = json.dumps(data).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {AUTH_TOKEN}")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        try:
+            return json.loads(body)
+        except:
+            return {"ok": False, "error": f"HTTP {e.code}: {body}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def cmd_ping():
+    r = api_call("ping", {})
+    print(json.dumps(r, indent=2))
+
+def cmd_read(args):
+    if not args:
+        print("ERROR: path is required", file=sys.stderr); sys.exit(1)
+    data = {"path": args[0]}
+    numbered = False
+    i = 1
+    while i < len(args):
+        if args[i] in ("-n", "--numbered"):
+            numbered = True; data["numbered"] = True; i += 1
+        elif args[i] == "--offset" and i+1 < len(args):
+            data["offset"] = int(args[i+1]); i += 2
+        elif args[i] == "--limit" and i+1 < len(args):
+            data["limit"] = int(args[i+1]); i += 2
+        else:
+            i += 1
+    r = api_call("read", data)
+    if r.get("ok"):
+        print(r["content"])
+        total = r.get("total_lines", "?")
+        size = r.get("size", "?")
+        if numbered or data.get("offset") or data.get("limit"):
+            start = r.get("start_line", 1)
+            shown = r["content"].count("\n") + 1
+            print(f"\n--- {total} lines total, {size} bytes, showing from line {start} ({shown} lines) ---", file=sys.stderr)
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_write(args):
+    if not args:
+        print("ERROR: path is required", file=sys.stderr); sys.exit(1)
+    path = args[0]
+    content = None
+    i = 1
+    while i < len(args):
+        if args[i] == "--content" and i+1 < len(args):
+            content = args[i+1]; i += 2
+        elif args[i] == "--file" and i+1 < len(args):
+            with open(args[i+1], "r") as f: content = f.read()
+            i += 2
+        else:
+            i += 1
+    if content is None:
+        if not sys.stdin.isatty():
+            content = sys.stdin.read()
+        else:
+            print("ERROR: provide content via stdin, --content, or --file", file=sys.stderr)
+            sys.exit(1)
+    r = api_call("write", {"path": path, "content": content})
+    if r.get("ok"):
+        print(f"Written {r['written']} bytes to {path}")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_edit(args):
+    if not args:
+        print("ERROR: path is required", file=sys.stderr); sys.exit(1)
+    path = args[0]
+    old = new = None
+    replace_all = False
+    use_stdin = False
+    i = 1
+    while i < len(args):
+        if args[i] == "--old" and i+1 < len(args):
+            old = args[i+1]; i += 2
+        elif args[i] == "--new" and i+1 < len(args):
+            new = args[i+1]; i += 2
+        elif args[i] == "--old-file" and i+1 < len(args):
+            with open(args[i+1], "r") as f: old = f.read()
+            i += 2
+        elif args[i] == "--new-file" and i+1 < len(args):
+            with open(args[i+1], "r") as f: new = f.read()
+            i += 2
+        elif args[i] in ("--all", "--replace-all"):
+            replace_all = True; i += 1
+        elif args[i] == "--stdin":
+            use_stdin = True; i += 1
+        else:
+            i += 1
+    if use_stdin or (old is None and new is None and not sys.stdin.isatty()):
+        try:
+            stdin_data = json.loads(sys.stdin.read())
+            old = stdin_data.get("old", old)
+            new = stdin_data.get("new", new)
+            if "replace_all" in stdin_data:
+                replace_all = stdin_data["replace_all"]
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Invalid JSON on stdin: {e}", file=sys.stderr)
+            sys.exit(1)
+    if old is None or new is None:
+        print("ERROR: --old and --new are required (or pipe JSON via stdin)", file=sys.stderr)
+        sys.exit(1)
+    old = old.replace("\\!", "!")
+    new = new.replace("\\!", "!")
+    r = api_call("edit", {"path": path, "old_string": old, "new_string": new, "replace_all": replace_all})
+    if r.get("ok"):
+        print(f"Replaced {r['replacements']} occurrence(s)")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_edit_lines(args):
+    """Line-based editing: delete, insert, replace by line numbers."""
+    if not args:
+        print("ERROR: path is required", file=sys.stderr); sys.exit(1)
+    path = args[0]
+    action = None
+    start = end = 0
+    content = None
+    i = 1
+    while i < len(args):
+        if args[i] == "--delete" and i+1 < len(args):
+            action = "delete"
+            start, end = _parse_range(args[i+1]); i += 2
+        elif args[i] == "--insert" and i+1 < len(args):
+            action = "insert"
+            start = int(args[i+1]); end = start; i += 2
+        elif args[i] == "--replace" and i+1 < len(args):
+            action = "replace"
+            start, end = _parse_range(args[i+1]); i += 2
+        elif args[i] == "--content" and i+1 < len(args):
+            content = args[i+1]; i += 2
+        else:
+            i += 1
+    if action is None:
+        print("ERROR: --delete, --insert, or --replace is required", file=sys.stderr)
+        sys.exit(1)
+    if action in ("insert", "replace") and content is None:
+        if not sys.stdin.isatty():
+            content = sys.stdin.read()
+        else:
+            print("ERROR: content required via stdin or --content", file=sys.stderr)
+            sys.exit(1)
+    data = {"path": path, "action": action, "start": start, "end": end}
+    if content is not None:
+        data["content"] = content
+    r = api_call("edit-lines", data)
+    if r.get("ok"):
+        print(r.get("info", "done"))
+        print(f"  {r.get('old_lines','?')} -> {r.get('new_lines','?')} lines", file=sys.stderr)
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def _parse_range(s):
+    """Parse '10-20' or '10' into (start, end)."""
+    if "-" in s:
+        parts = s.split("-", 1)
+        return int(parts[0]), int(parts[1])
+    n = int(s)
+    return n, n
+
+def cmd_patch(args):
+    """Apply multiple edits atomically: ws-api patch <path> < edits.json"""
+    if not args:
+        print("ERROR: path is required", file=sys.stderr); sys.exit(1)
+    path = args[0]
+    if not sys.stdin.isatty():
+        try:
+            edits = json.loads(sys.stdin.read())
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Invalid JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("ERROR: pipe edits JSON via stdin", file=sys.stderr)
+        print('  Example: echo \'[{"old":"x","new":"y"},{"old":"a","new":"b"}]\' | ws-api patch file', file=sys.stderr)
+        sys.exit(1)
+    # Accept both array and object with "edits" key
+    if isinstance(edits, list):
+        edits_list = edits
+    elif isinstance(edits, dict) and "edits" in edits:
+        edits_list = edits["edits"]
+    else:
+        print("ERROR: expected JSON array or {\"edits\":[...]}", file=sys.stderr)
+        sys.exit(1)
+    # Normalize: accept "old"/"new" shorthand
+    normalized = []
+    for e in edits_list:
+        normalized.append({
+            "old_string": e.get("old_string", e.get("old", "")),
+            "new_string": e.get("new_string", e.get("new", "")),
+        })
+    r = api_call("patch", {"path": path, "edits": normalized})
+    if r.get("ok"):
+        print(f"Applied {r.get('edits_applied', '?')} edit(s)")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def _handle_exec_result(r):
+    """Process exec result: print stdout to stdout, stderr to stderr, exit with code."""
+    if r.get("ok"):
+        # Use separated stdout/stderr if available, fall back to combined
+        if r.get("stdout") is not None:
+            if r["stdout"]:
+                print(r["stdout"], end="", file=sys.stdout)
+            if r.get("stderr"):
+                print(r["stderr"], end="", file=sys.stderr)
+        elif r.get("output"):
+            print(r["output"], end="")
+        if r.get("timed_out"):
+            print("\n[ws-api] Command timed out", file=sys.stderr)
+        sys.exit(r.get("exit_code", 0))
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_exec(args):
+    if not args:
+        print("ERROR: command is required", file=sys.stderr); sys.exit(1)
+    command = args[0]
+    data = {"command": command}
+    i = 1
+    while i < len(args):
+        if args[i] in ("--dir", "-C") and i+1 < len(args):
+            data["dir"] = args[i+1]; i += 2
+        elif args[i] == "--timeout" and i+1 < len(args):
+            data["timeout"] = int(args[i+1]); i += 2
+        else:
+            i += 1
+    _handle_exec_result(api_call("exec", data))
+
+def cmd_exec_transparent(all_args):
+    """Transparent exec: join all args into a command, preserving quoting."""
+    command = " ".join(shlex.quote(a) for a in all_args)
+    _handle_exec_result(api_call("exec", {"command": command}))
+
+def cmd_glob(args):
+    if not args:
+        print("ERROR: pattern is required", file=sys.stderr); sys.exit(1)
+    data = {"pattern": args[0]}
+    i = 1
+    while i < len(args):
+        if args[i] == "--path" and i+1 < len(args):
+            data["path"] = args[i+1]; i += 2
+        else:
+            i += 1
+    r = api_call("glob", data)
+    if r.get("ok"):
+        for f in r.get("files", []):
+            print(f)
+        print(f"\n{r['count']} file(s) found", file=sys.stderr)
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_grep(args):
+    if not args:
+        print("ERROR: pattern is required", file=sys.stderr); sys.exit(1)
+    data = {"pattern": args[0]}
+    i = 1
+    while i < len(args):
+        if args[i] == "--path" and i+1 < len(args):
+            data["path"] = args[i+1]; i += 2
+        elif args[i] == "--glob" and i+1 < len(args):
+            data["glob"] = args[i+1]; i += 2
+        elif args[i] == "--context" and i+1 < len(args):
+            data["context"] = int(args[i+1]); i += 2
+        else:
+            i += 1
+    r = api_call("grep", data)
+    if r.get("ok"):
+        if r.get("output"):
+            print(r["output"], end="")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_raw(args):
+    """Raw JSON mode: ws-api raw <endpoint> < json_body"""
+    if not args:
+        print("ERROR: endpoint is required", file=sys.stderr); sys.exit(1)
+    endpoint = args[0]
+    data = json.loads(sys.stdin.read())
+    r = api_call(endpoint, data)
+    print(json.dumps(r, indent=2))
+
+COMMANDS = {
+    "ping":       lambda a: cmd_ping(),
+    "read":       lambda a: cmd_read(a),
+    "write":      lambda a: cmd_write(a),
+    "edit":       lambda a: cmd_edit(a),
+    "edit-lines": lambda a: cmd_edit_lines(a),
+    "patch":      lambda a: cmd_patch(a),
+    "exec":       lambda a: cmd_exec(a),
+    "glob":       lambda a: cmd_glob(a),
+    "grep":       lambda a: cmd_grep(a),
+    "raw":        lambda a: cmd_raw(a),
+    "help":       lambda a: print(__doc__),
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd in COMMANDS:
+        COMMANDS[cmd](args)
+    elif cmd.startswith("-"):
+        # Flag-like first arg = probably meant help
+        print(__doc__)
+        sys.exit(1)
+    else:
+        # Transparent exec: ws-api ls -la /root -> exec "ls -la /root"
+        cmd_exec_transparent(sys.argv[1:])
