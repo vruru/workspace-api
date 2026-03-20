@@ -135,6 +135,7 @@ def cmd_edit(args):
     old = new = None
     replace_all = False
     use_stdin = False
+    positional = []
     i = 1
     while i < len(args):
         if args[i] == "--old" and i+1 < len(args):
@@ -152,19 +153,28 @@ def cmd_edit(args):
         elif args[i] == "--stdin":
             use_stdin = True; i += 1
         else:
-            i += 1
-    if use_stdin or (old is None and new is None and not sys.stdin.isatty()):
-        try:
-            stdin_data = json.loads(sys.stdin.read())
-            old = stdin_data.get("old", old)
-            new = stdin_data.get("new", new)
-            if "replace_all" in stdin_data:
-                replace_all = stdin_data["replace_all"]
-        except json.JSONDecodeError as e:
-            print(f"ERROR: Invalid JSON on stdin: {e}", file=sys.stderr)
-            sys.exit(1)
+            positional.append(args[i]); i += 1
+    # Support positional: ws-api edit <path> "old" "new"
+    if old is None and len(positional) >= 1:
+        old = positional[0]
+    if new is None and len(positional) >= 2:
+        new = positional[1]
+    # Try stdin only if explicitly requested or if we still need old/new
+    if old is None and new is None:
+        if use_stdin or not sys.stdin.isatty():
+            stdin_text = sys.stdin.read()
+            if stdin_text.strip():
+                try:
+                    stdin_data = json.loads(stdin_text)
+                    old = stdin_data.get("old", old)
+                    new = stdin_data.get("new", new)
+                    if "replace_all" in stdin_data:
+                        replace_all = stdin_data["replace_all"]
+                except json.JSONDecodeError as e:
+                    print(f"ERROR: Invalid JSON on stdin: {e}", file=sys.stderr)
+                    sys.exit(1)
     if old is None or new is None:
-        print("ERROR: --old and --new are required (or pipe JSON via stdin)", file=sys.stderr)
+        print("ERROR: provide old/new via positional args, --old/--new flags, or pipe JSON via stdin", file=sys.stderr)
         sys.exit(1)
     old = old.replace("\\!", "!")
     new = new.replace("\\!", "!")
