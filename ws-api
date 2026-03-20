@@ -10,16 +10,30 @@ All data: json.dumps() -> HTTPS -> json.loads(), never through shell parsing.
   ws-api cat /etc/hostname
   ws-api docker ps
 
+== Background exec ==
+  ws-api go build ./... --bg                    # returns job ID immediately
+  ws-api exec "make build" --bg                 # explicit exec, background
+  ws-api jobs                                   # list all jobs
+  ws-api job <id>                               # get job output (real-time if running)
+  ws-api job <id> --clear                       # get output & remove job
+  ws-api kill <id>                              # kill a running bg job
+
 == File operations ==
   ws-api read <path> [-n] [--offset N] [--limit N]
   ws-api write <path> < file                         # stdin
   ws-api write <path> --content "text"               # inline
   ws-api write <path> --file local.txt               # from local file
 
-== Text editing (find & replace, no escaping issues via stdin JSON) ==
-  ws-api edit <path> --old "old" --new "new" [--all]
-  ws-api edit <path> --old-file old.txt --new-file new.txt
-  echo '{"old":"...","new":"..."}' | ws-api edit <path>
+== File transfer (binary-safe, base64) ==
+  ws-api upload <local-path> <remote-path> [--mode 0755]
+  ws-api download <remote-path> <local-path>
+
+== Text editing (find & replace) ==
+  ws-api edit <path> "old text" "new text" [--all]    # simple text (no $`! chars)
+  ws-api edit <path> --old "old" --new "new" [--all]  # named args
+  ws-api edit <path> --old-file o.txt --new-file n.txt # shell-safe for regex/$`!
+  ws-api edit <path> --dry-run ...                    # preview without writing
+  echo '{"old":"...","new":"..."}' | ws-api edit <path> # pipe JSON (also shell-safe)
 
 == Line-based editing (by line numbers) ==
   ws-api edit-lines <path> --delete 10-20
@@ -35,14 +49,16 @@ All data: json.dumps() -> HTTPS -> json.loads(), never through shell parsing.
   ws-api grep "pattern" [--path /root/workspace] [--glob "*.go"] [--context 2]
 
 == Explicit exec (with options) ==
-  ws-api exec "command" [--dir /path] [--timeout 60]
+  ws-api exec "command" [--dir /path] [--timeout 60] [--bg]
 
 == Other ==
   ws-api ping
   ws-api raw <endpoint> < json_body
   ws-api help
 """
+import base64
 import json
+import os
 import shlex
 import sys
 import urllib.request
@@ -58,7 +74,7 @@ def api_call(endpoint, data):
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", f"Bearer {AUTH_TOKEN}")
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8")
@@ -134,6 +150,7 @@ def cmd_edit(args):
     path = args[0]
     old = new = None
     replace_all = False
+    dry_run = False
     use_stdin = False
     positional = []
     i = 1
@@ -150,6 +167,8 @@ def cmd_edit(args):
             i += 2
         elif args[i] in ("--all", "--replace-all"):
             replace_all = True; i += 1
+        elif args[i] == "--dry-run":
+            dry_run = True; i += 1
         elif args[i] == "--stdin":
             use_stdin = True; i += 1
         else:
@@ -176,13 +195,46 @@ def cmd_edit(args):
     if old is None or new is None:
         print("ERROR: provide old/new via positional args, --old/--new flags, or pipe JSON via stdin", file=sys.stderr)
         sys.exit(1)
+    # Legacy compat: unescape \! from older shell workarounds
     old = old.replace("\\!", "!")
     new = new.replace("\\!", "!")
-    r = api_call("edit", {"path": path, "old_string": old, "new_string": new, "replace_all": replace_all})
+    data = {"path": path, "old_string": old, "new_string": new, "replace_all": replace_all}
+    if dry_run:
+        data["dry_run"] = True
+    r = api_call("edit", data)
     if r.get("ok"):
-        print(f"Replaced {r['replacements']} occurrence(s)")
+        if r.get("dry_run"):
+            count = r.get("replacements", 0)
+            locs = r.get("locations", [])
+            delta = r.get("size_delta", 0)
+            print(f"[dry-run] Would replace {count} occurrence(s)")
+            if locs:
+                print(f"  Lines: {', '.join(str(l) for l in locs)}")
+            print(f"  Old length: {r.get('old_length', '?')} chars")
+            print(f"  New length: {r.get('new_length', '?')} chars")
+            print(f"  Size delta: {'+' if delta >= 0 else ''}{delta} bytes")
+        else:
+            print(f"Replaced {r['replacements']} occurrence(s)")
+            locs = r.get("locations")
+            if locs:
+                print(f"  Lines: {', '.join(str(l) for l in locs)}", file=sys.stderr)
     else:
-        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        err = r.get('error', 'unknown')
+        print(f"ERROR: {err}", file=sys.stderr)
+        # Smart hint: if old_string not found and was from positional args, warn about shell escaping
+        if "not found" in err.lower() or "not unique" in err.lower():
+            has_shell_chars = any(c in (old + new) for c in '$`!')
+            from_positional = len(positional) >= 1
+            if from_positional and not has_shell_chars:
+                print("", file=sys.stderr)
+                print("HINT: If your text contained $, `, or ! characters, they may have been", file=sys.stderr)
+                print("      eaten by the shell. Use one of these shell-safe methods instead:", file=sys.stderr)
+                print("", file=sys.stderr)
+                print("  # Method 1: --old-file / --new-file (most reliable)", file=sys.stderr)
+                print("  ws-api edit <path> --old-file /tmp/old.txt --new-file /tmp/new.txt", file=sys.stderr)
+                print("", file=sys.stderr)
+                print("  # Method 2: pipe JSON via stdin", file=sys.stderr)
+                print('  echo \'{"old":"...","new":"..."}\' | ws-api edit <path>', file=sys.stderr)
         sys.exit(1)
 
 def cmd_edit_lines(args):
@@ -285,7 +337,7 @@ def _handle_exec_result(r):
         elif r.get("output"):
             print(r["output"], end="")
         if r.get("timed_out"):
-            print("\n[ws-api] Command timed out", file=sys.stderr)
+            print("\n[ws-api] Command timed out (partial output above)", file=sys.stderr)
         sys.exit(r.get("exit_code", 0))
     else:
         print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
@@ -296,20 +348,191 @@ def cmd_exec(args):
         print("ERROR: command is required", file=sys.stderr); sys.exit(1)
     command = args[0]
     data = {"command": command}
+    bg = False
     i = 1
     while i < len(args):
         if args[i] in ("--dir", "-C") and i+1 < len(args):
             data["dir"] = args[i+1]; i += 2
         elif args[i] == "--timeout" and i+1 < len(args):
             data["timeout"] = int(args[i+1]); i += 2
+        elif args[i] == "--bg":
+            bg = True; i += 1
         else:
             i += 1
-    _handle_exec_result(api_call("exec", data))
+    if bg:
+        _handle_exec_bg(data)
+    else:
+        _handle_exec_result(api_call("exec", data))
+
+def _handle_exec_bg(data):
+    """Submit background job and print job ID."""
+    r = api_call("exec-bg", data)
+    if r.get("ok"):
+        job_id = r.get("job_id", "?")
+        print(f"Background job started: {job_id}")
+        print(f"  Command: {r.get('command', '?')}")
+        print(f"  Check status: ws-api job {job_id}")
+        print(f"  List all:     ws-api jobs")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
 
 def cmd_exec_transparent(all_args):
     """Transparent exec: join all args into a command, preserving quoting."""
-    command = " ".join(shlex.quote(a) for a in all_args)
-    _handle_exec_result(api_call("exec", {"command": command}))
+    # Check for --bg flag anywhere in args
+    bg = False
+    filtered = []
+    timeout = None
+    i = 0
+    while i < len(all_args):
+        if all_args[i] == "--bg":
+            bg = True; i += 1
+        elif all_args[i] == "--timeout" and i+1 < len(all_args):
+            timeout = int(all_args[i+1]); i += 2
+        else:
+            filtered.append(all_args[i]); i += 1
+    command = " ".join(shlex.quote(a) for a in filtered)
+    data = {"command": command}
+    if timeout is not None:
+        data["timeout"] = timeout
+    if bg:
+        _handle_exec_bg(data)
+    else:
+        _handle_exec_result(api_call("exec", data))
+
+def cmd_jobs(args):
+    """List background jobs."""
+    r = api_call("jobs", {})
+    if r.get("ok"):
+        jobs = r.get("jobs", [])
+        if not jobs:
+            print("No background jobs")
+            return
+        print(f"{'ID':<16} {'STATUS':<10} {'EXIT':<6} {'OUTPUT':<10} {'COMMAND'}")
+        print("-" * 80)
+        for j in jobs:
+            status = j.get("status", "?")
+            if j.get("timed_out"):
+                status = "timeout"
+            eid = str(j.get("exit_code", "")) if status != "running" else ""
+            # Show live output size for running jobs
+            if status == "running":
+                out_bytes = j.get("stdout_bytes", 0) + j.get("stderr_bytes", 0)
+                out_info = f"{out_bytes}B" if out_bytes > 0 else "-"
+            else:
+                out_info = ""
+            print(f"{j['id']:<16} {status:<10} {eid:<6} {out_info:<10} {j.get('command', '?')}")
+        print(f"\n{len(jobs)} job(s)", file=sys.stderr)
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_job(args):
+    """Get job detail/output."""
+    if not args:
+        print("ERROR: job id is required", file=sys.stderr); sys.exit(1)
+    job_id = args[0]
+    clear = "--clear" in args
+    r = api_call("job", {"id": job_id, "clear": clear})
+    if r.get("ok"):
+        status = r.get("status", "?")
+        status_extra = ""
+        if r.get("timed_out"):
+            status_extra = " (timed out)"
+        elif status == "killed":
+            status_extra = " (manually killed)"
+        print(f"Job:     {r.get('id')}")
+        print(f"Status:  {status}{status_extra}")
+        print(f"Command: {r.get('command')}")
+        if r.get("dir"):
+            print(f"Dir:     {r['dir']}")
+        if status != "running":
+            print(f"Exit:    {r.get('exit_code', '?')}")
+        # Print output
+        stdout = r.get("stdout", "")
+        stderr = r.get("stderr", "")
+        if stdout:
+            label = "stdout (live)" if status == "running" else "stdout"
+            print(f"\n--- {label} ---")
+            print(stdout, end="")
+        if stderr:
+            label = "stderr (live)" if status == "running" else "stderr"
+            print(f"\n--- {label} ---", file=sys.stderr)
+            print(stderr, end="", file=sys.stderr)
+        if not stdout and not stderr:
+            if status == "running":
+                print("\n(running, no output yet)")
+            else:
+                print("\n(no output)")
+        if clear:
+            print(f"\n[job cleared]", file=sys.stderr)
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_kill(args):
+    """Kill a running background job."""
+    if not args:
+        print("ERROR: job id is required", file=sys.stderr); sys.exit(1)
+    job_id = args[0]
+    r = api_call("job-kill", {"id": job_id})
+    if r.get("ok"):
+        print(f"Job {job_id} killed")
+        print(f"  Use 'ws-api job {job_id}' to see final output")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_upload(args):
+    """Upload local file to remote: ws-api upload <local> <remote> [--mode 0755]"""
+    if len(args) < 2:
+        print("ERROR: usage: ws-api upload <local-path> <remote-path> [--mode 0755]", file=sys.stderr)
+        sys.exit(1)
+    local_path = args[0]
+    remote_path = args[1]
+    mode = 0o644
+    i = 2
+    while i < len(args):
+        if args[i] == "--mode" and i+1 < len(args):
+            mode = int(args[i+1], 8); i += 2
+        else:
+            i += 1
+    if not os.path.isfile(local_path):
+        print(f"ERROR: local file not found: {local_path}", file=sys.stderr)
+        sys.exit(1)
+    with open(local_path, "rb") as f:
+        data = f.read()
+    encoded = base64.b64encode(data).decode("ascii")
+    local_size = len(data)
+    print(f"Uploading {local_path} ({local_size} bytes) -> {remote_path}")
+    r = api_call("upload", {"path": remote_path, "content": encoded, "mode": mode})
+    if r.get("ok"):
+        print(f"Uploaded {r.get('written', '?')} bytes to {remote_path}")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_download(args):
+    """Download remote file to local: ws-api download <remote> <local>"""
+    if len(args) < 2:
+        print("ERROR: usage: ws-api download <remote-path> <local-path>", file=sys.stderr)
+        sys.exit(1)
+    remote_path = args[0]
+    local_path = args[1]
+    print(f"Downloading {remote_path} -> {local_path}")
+    r = api_call("download", {"path": remote_path})
+    if r.get("ok"):
+        data = base64.b64decode(r["content"])
+        # Ensure local directory exists
+        local_dir = os.path.dirname(local_path)
+        if local_dir:
+            os.makedirs(local_dir, exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(data)
+        print(f"Downloaded {len(data)} bytes to {local_path}")
+    else:
+        print(f"ERROR: {r.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
 
 def cmd_glob(args):
     if not args:
@@ -372,6 +595,11 @@ COMMANDS = {
     "glob":       lambda a: cmd_glob(a),
     "grep":       lambda a: cmd_grep(a),
     "raw":        lambda a: cmd_raw(a),
+    "jobs":       lambda a: cmd_jobs(a),
+    "job":        lambda a: cmd_job(a),
+    "kill":       lambda a: cmd_kill(a),
+    "upload":     lambda a: cmd_upload(a),
+    "download":   lambda a: cmd_download(a),
     "help":       lambda a: print(__doc__),
 }
 
