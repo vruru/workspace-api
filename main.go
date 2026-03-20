@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -30,13 +31,38 @@ var cfg struct {
 	CertDir   string
 }
 
+// ── Thread-Safe Buffer ─────────────────────────────────────────────
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (sb *safeBuffer) Write(p []byte) (n int, err error) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.Write(p)
+}
+
+func (sb *safeBuffer) String() string {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.String()
+}
+
+func (sb *safeBuffer) Len() int {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.Len()
+}
+
 // ── Background Job System ──────────────────────────────────────────
 
 type Job struct {
 	ID        string `json:"id"`
 	Command   string `json:"command"`
 	Dir       string `json:"dir,omitempty"`
-	Status    string `json:"status"` // running, done, error
+	Status    string `json:"status"` // running, done, error, killed
 	Stdout    string `json:"stdout"`
 	Stderr    string `json:"stderr"`
 	ExitCode  int    `json:"exit_code"`
@@ -44,6 +70,11 @@ type Job struct {
 	StartedAt int64  `json:"started_at"`
 	DoneAt    int64  `json:"done_at,omitempty"`
 	mu        sync.Mutex
+	// Live output (only while running)
+	stdoutBuf *safeBuffer
+	stderrBuf *safeBuffer
+	// Process control
+	cancel context.CancelFunc
 }
 
 var (
@@ -54,6 +85,26 @@ var (
 func genJobID() string {
 	n := atomic.AddInt64(&jobCounter, 1)
 	return fmt.Sprintf("j%d_%04x", n, rand.Intn(0xFFFF))
+}
+
+// Clean up completed jobs older than 1 hour, runs every 5 minutes
+func jobCleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now().Unix()
+		jobStore.Range(func(key, value interface{}) bool {
+			job := value.(*Job)
+			job.mu.Lock()
+			shouldDelete := job.Status != "running" && job.DoneAt > 0 && now-job.DoneAt > 3600
+			job.mu.Unlock()
+			if shouldDelete {
+				jobStore.Delete(key)
+				log.Printf("[job-cleanup] Removed old job %s", key)
+			}
+			return true
+		})
+	}
 }
 
 // ── Config ─────────────────────────────────────────────────────────
@@ -91,6 +142,9 @@ func main() {
 	cfg.AuthToken = envOr("WS_AUTH_TOKEN", "capy-workspace-7f3a9b2e")
 	cfg.CertDir = envOr("WS_CERT_DIR", "/root/workspace/.certs")
 
+	// Start background job cleanup
+	go jobCleanupLoop()
+
 	mux := http.NewServeMux()
 	// Existing routes
 	mux.HandleFunc("/api/read", withAuth(handleRead))
@@ -102,10 +156,12 @@ func main() {
 	mux.HandleFunc("/api/edit-lines", withAuth(handleEditLines))
 	mux.HandleFunc("/api/patch", withAuth(handlePatch))
 	mux.HandleFunc("/api/ping", handlePing)
-	// New routes
+	// Job routes
 	mux.HandleFunc("/api/exec-bg", withAuth(handleExecBg))
 	mux.HandleFunc("/api/jobs", withAuth(handleJobs))
 	mux.HandleFunc("/api/job", withAuth(handleJob))
+	mux.HandleFunc("/api/job-kill", withAuth(handleJobKill))
+	// File transfer
 	mux.HandleFunc("/api/upload", withAuth(handleUpload))
 	mux.HandleFunc("/api/download", withAuth(handleDownload))
 
@@ -582,9 +638,7 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 			select {
 			case <-done:
-				// Process exited after SIGTERM
 			case <-time.After(5 * time.Second):
-				// Force kill after 5s grace
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				<-done
 			}
@@ -617,11 +671,17 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Timeout <= 0 {
-		req.Timeout = 300 // default 5 min for bg
+		req.Timeout = 300
 	}
 	if req.Timeout > 3600 {
-		req.Timeout = 3600 // max 1 hour
+		req.Timeout = 3600
 	}
+
+	// Context handles both timeout and manual kill
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Timeout)*time.Second)
+
+	stdoutBuf := &safeBuffer{}
+	stderrBuf := &safeBuffer{}
 
 	job := &Job{
 		ID:        genJobID(),
@@ -629,10 +689,15 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 		Dir:       req.Dir,
 		Status:    "running",
 		StartedAt: time.Now().Unix(),
+		stdoutBuf: stdoutBuf,
+		stderrBuf: stderrBuf,
+		cancel:    cancel,
 	}
 	jobStore.Store(job.ID, job)
 
 	go func() {
+		defer cancel() // release context resources
+
 		cmd := exec.Command("bash", "-c", req.Command)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		if req.Dir != "" {
@@ -644,15 +709,18 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 			"GOPATH=/root/go",
 		)
 
-		var stdoutBuf, stderrBuf strings.Builder
-		cmd.Stdout = &stdoutBuf
-		cmd.Stderr = &stderrBuf
+		// Use safeBuffer for real-time output
+		cmd.Stdout = stdoutBuf
+		cmd.Stderr = stderrBuf
 
 		if err := cmd.Start(); err != nil {
 			job.mu.Lock()
 			job.Status = "error"
 			job.Stderr = "Start failed: " + err.Error()
 			job.DoneAt = time.Now().Unix()
+			job.stdoutBuf = nil
+			job.stderrBuf = nil
+			job.cancel = nil
 			job.mu.Unlock()
 			return
 		}
@@ -662,16 +730,15 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 			done <- cmd.Wait()
 		}()
 
-		timer := time.NewTimer(time.Duration(req.Timeout) * time.Second)
-		defer timer.Stop()
-
 		var cmdErr error
 		timedOut := false
+		killed := false
 
 		select {
 		case cmdErr = <-done:
-		case <-timer.C:
-			timedOut = true
+			// Normal completion
+		case <-ctx.Done():
+			// Either timeout or manual kill
 			if cmd.Process != nil {
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 				select {
@@ -681,14 +748,27 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 					<-done
 				}
 			}
+			if ctx.Err() == context.DeadlineExceeded {
+				timedOut = true
+			} else {
+				killed = true
+			}
 		}
 
+		// Finalize job
 		job.mu.Lock()
 		job.Stdout = stdoutBuf.String()
 		job.Stderr = stderrBuf.String()
 		job.DoneAt = time.Now().Unix()
 		job.TimedOut = timedOut
-		if timedOut {
+		job.stdoutBuf = nil // release buffers
+		job.stderrBuf = nil
+		job.cancel = nil
+
+		if killed {
+			job.Status = "killed"
+			job.ExitCode = 137
+		} else if timedOut {
 			job.ExitCode = 124
 			job.Status = "done"
 		} else if cmdErr != nil {
@@ -719,7 +799,7 @@ func handleJobs(w http.ResponseWriter, r *http.Request) {
 	jobStore.Range(func(key, value interface{}) bool {
 		job := value.(*Job)
 		job.mu.Lock()
-		jobs = append(jobs, map[string]interface{}{
+		entry := map[string]interface{}{
 			"id":         job.ID,
 			"command":    truncate(job.Command, 80),
 			"status":     job.Status,
@@ -727,8 +807,14 @@ func handleJobs(w http.ResponseWriter, r *http.Request) {
 			"timed_out":  job.TimedOut,
 			"started_at": job.StartedAt,
 			"done_at":    job.DoneAt,
-		})
+		}
+		// Include live output size for running jobs
+		if job.Status == "running" && job.stdoutBuf != nil {
+			entry["stdout_bytes"] = job.stdoutBuf.Len()
+			entry["stderr_bytes"] = job.stderrBuf.Len()
+		}
 		job.mu.Unlock()
+		jobs = append(jobs, entry)
 		return true
 	})
 	if jobs == nil {
@@ -766,12 +852,18 @@ func handleJob(w http.ResponseWriter, r *http.Request) {
 		"command":    job.Command,
 		"dir":        job.Dir,
 		"status":     job.Status,
-		"stdout":     job.Stdout,
-		"stderr":     job.Stderr,
 		"exit_code":  job.ExitCode,
 		"timed_out":  job.TimedOut,
 		"started_at": job.StartedAt,
 		"done_at":    job.DoneAt,
+	}
+	// Read from live buffers if running, else from finalized fields
+	if job.Status == "running" && job.stdoutBuf != nil {
+		result["stdout"] = job.stdoutBuf.String()
+		result["stderr"] = job.stderrBuf.String()
+	} else {
+		result["stdout"] = job.Stdout
+		result["stderr"] = job.Stderr
 	}
 	status := job.Status
 	job.mu.Unlock()
@@ -781,6 +873,48 @@ func handleJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w, result)
+}
+
+// ── Job Kill ───────────────────────────────────────────────────────
+
+func handleJobKill(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.ID == "" {
+		jsonError(w, 400, "id is required")
+		return
+	}
+
+	val, ok := jobStore.Load(req.ID)
+	if !ok {
+		jsonError(w, 404, "job not found: "+req.ID)
+		return
+	}
+	job := val.(*Job)
+
+	job.mu.Lock()
+	if job.Status != "running" {
+		status := job.Status
+		job.mu.Unlock()
+		jsonError(w, 400, fmt.Sprintf("job is not running (status: %s)", status))
+		return
+	}
+	cancelFn := job.cancel
+	job.mu.Unlock()
+
+	if cancelFn != nil {
+		cancelFn() // triggers ctx.Done() in the goroutine
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"killed": true,
+		"id":     req.ID,
+	})
 }
 
 // ── File Upload (base64) ───────────────────────────────────────────
