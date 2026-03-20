@@ -4,16 +4,20 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,6 +29,34 @@ var cfg struct {
 	AuthToken string
 	CertDir   string
 }
+
+// ── Background Job System ──────────────────────────────────────────
+
+type Job struct {
+	ID        string `json:"id"`
+	Command   string `json:"command"`
+	Dir       string `json:"dir,omitempty"`
+	Status    string `json:"status"` // running, done, error
+	Stdout    string `json:"stdout"`
+	Stderr    string `json:"stderr"`
+	ExitCode  int    `json:"exit_code"`
+	TimedOut  bool   `json:"timed_out"`
+	StartedAt int64  `json:"started_at"`
+	DoneAt    int64  `json:"done_at,omitempty"`
+	mu        sync.Mutex
+}
+
+var (
+	jobStore   sync.Map
+	jobCounter int64
+)
+
+func genJobID() string {
+	n := atomic.AddInt64(&jobCounter, 1)
+	return fmt.Sprintf("j%d_%04x", n, rand.Intn(0xFFFF))
+}
+
+// ── Config ─────────────────────────────────────────────────────────
 
 func loadEnv(path string) {
 	f, err := os.Open(path)
@@ -60,6 +92,7 @@ func main() {
 	cfg.CertDir = envOr("WS_CERT_DIR", "/root/workspace/.certs")
 
 	mux := http.NewServeMux()
+	// Existing routes
 	mux.HandleFunc("/api/read", withAuth(handleRead))
 	mux.HandleFunc("/api/write", withAuth(handleWrite))
 	mux.HandleFunc("/api/edit", withAuth(handleEdit))
@@ -69,6 +102,12 @@ func main() {
 	mux.HandleFunc("/api/edit-lines", withAuth(handleEditLines))
 	mux.HandleFunc("/api/patch", withAuth(handlePatch))
 	mux.HandleFunc("/api/ping", handlePing)
+	// New routes
+	mux.HandleFunc("/api/exec-bg", withAuth(handleExecBg))
+	mux.HandleFunc("/api/jobs", withAuth(handleJobs))
+	mux.HandleFunc("/api/job", withAuth(handleJob))
+	mux.HandleFunc("/api/upload", withAuth(handleUpload))
+	mux.HandleFunc("/api/download", withAuth(handleDownload))
 
 	certManager := autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
@@ -119,6 +158,8 @@ func main() {
 	httpSrv.Shutdown(ctx)
 }
 
+// ── HTTP Helpers ───────────────────────────────────────────────────
+
 func redirectHTTPS(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusMovedPermanently)
 }
@@ -141,13 +182,32 @@ func withAuth(handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func jsonOK(w http.ResponseWriter, data map[string]interface{}) {
+	data["ok"] = true
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func jsonError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":    false,
+		"error": message,
+	})
+}
+
+// ── Ping ───────────────────────────────────────────────────────────
+
 func handlePing(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"pong": true, "time": time.Now().Unix()})
 }
 
+// ── File Read ──────────────────────────────────────────────────────
+
 func handleRead(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path   string `json:"path"`
+		Path     string `json:"path"`
 		Offset   int    `json:"offset"`
 		Limit    int    `json:"limit"`
 		Numbered bool   `json:"numbered"`
@@ -200,6 +260,8 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── File Write ─────────────────────────────────────────────────────
+
 func handleWrite(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path    string `json:"path"`
@@ -228,12 +290,15 @@ func handleWrite(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"written": len(req.Content)})
 }
 
+// ── Text Edit (find & replace) ─────────────────────────────────────
+
 func handleEdit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path       string `json:"path"`
 		OldString  string `json:"old_string"`
 		NewString  string `json:"new_string"`
 		ReplaceAll bool   `json:"replace_all"`
+		DryRun     bool   `json:"dry_run"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, 400, "Invalid JSON: "+err.Error())
@@ -257,6 +322,33 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 400, "old_string not found in file")
 		return
 	}
+
+	// Find line numbers of all occurrences
+	var locations []int
+	searchFrom := 0
+	for {
+		idx := strings.Index(content[searchFrom:], req.OldString)
+		if idx < 0 {
+			break
+		}
+		lineNum := strings.Count(content[:searchFrom+idx], "\n") + 1
+		locations = append(locations, lineNum)
+		searchFrom += idx + len(req.OldString)
+	}
+
+	// Dry run: preview without writing, skip uniqueness check
+	if req.DryRun {
+		jsonOK(w, map[string]interface{}{
+			"dry_run":      true,
+			"replacements": count,
+			"locations":    locations,
+			"old_length":   len(req.OldString),
+			"new_length":   len(req.NewString),
+			"size_delta":   (len(req.NewString) - len(req.OldString)) * count,
+		})
+		return
+	}
+
 	if !req.ReplaceAll && count > 1 {
 		jsonError(w, 400, fmt.Sprintf("old_string found %d times, not unique. Use replace_all=true or provide more context", count))
 		return
@@ -274,8 +366,10 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jsonOK(w, map[string]interface{}{"replacements": count})
+	jsonOK(w, map[string]interface{}{"replacements": count, "locations": locations})
 }
+
+// ── Line-Based Edit ────────────────────────────────────────────────
 
 func handleEditLines(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -353,11 +447,13 @@ func handleEditLines(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w, map[string]interface{}{
-		"info":        info,
-		"old_lines":   totalLines,
-		"new_lines":   len(result),
+		"info":      info,
+		"old_lines": totalLines,
+		"new_lines": len(result),
 	})
 }
+
+// ── Batch Patch ────────────────────────────────────────────────────
 
 func handlePatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -415,6 +511,8 @@ func handlePatch(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"edits_applied": applied})
 }
 
+// ── Command Execution ──────────────────────────────────────────────
+
 func handleExec(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Command string `json:"command"`
@@ -436,10 +534,8 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 		req.Timeout = 300
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(req.Timeout)*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "bash", "-c", req.Command)
+	cmd := exec.Command("bash", "-c", req.Command)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if req.Dir != "" {
 		cmd.Dir = req.Dir
 	}
@@ -453,31 +549,318 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		jsonError(w, 500, "Start failed: "+err.Error())
+		return
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
 	exitCode := 0
 	timedOut := false
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			timedOut = true
-			exitCode = 124
-		} else if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			jsonError(w, 500, "Exec failed: "+err.Error())
-			return
+	timer := time.NewTimer(time.Duration(req.Timeout) * time.Second)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			} else {
+				jsonError(w, 500, "Exec failed: "+err.Error())
+				return
+			}
+		}
+	case <-timer.C:
+		timedOut = true
+		exitCode = 124
+		// Graceful: SIGTERM to process group first
+		if cmd.Process != nil {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			select {
+			case <-done:
+				// Process exited after SIGTERM
+			case <-time.After(5 * time.Second):
+				// Force kill after 5s grace
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				<-done
+			}
 		}
 	}
 
-	// Combined output for backward compat, plus separate stdout/stderr
-	combined := stdoutBuf.String() + stderrBuf.String()
 	jsonOK(w, map[string]interface{}{
-		"output":    combined,
+		"output":    stdoutBuf.String() + stderrBuf.String(),
 		"stdout":    stdoutBuf.String(),
 		"stderr":    stderrBuf.String(),
 		"exit_code": exitCode,
 		"timed_out": timedOut,
 	})
 }
+
+// ── Background Execution ───────────────────────────────────────────
+
+func handleExecBg(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Command string `json:"command"`
+		Dir     string `json:"dir"`
+		Timeout int    `json:"timeout"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.Command == "" {
+		jsonError(w, 400, "command is required")
+		return
+	}
+	if req.Timeout <= 0 {
+		req.Timeout = 300 // default 5 min for bg
+	}
+	if req.Timeout > 3600 {
+		req.Timeout = 3600 // max 1 hour
+	}
+
+	job := &Job{
+		ID:        genJobID(),
+		Command:   req.Command,
+		Dir:       req.Dir,
+		Status:    "running",
+		StartedAt: time.Now().Unix(),
+	}
+	jobStore.Store(job.ID, job)
+
+	go func() {
+		cmd := exec.Command("bash", "-c", req.Command)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if req.Dir != "" {
+			cmd.Dir = req.Dir
+		}
+		cmd.Env = append(os.Environ(),
+			"PATH=/root/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"HOME=/root",
+			"GOPATH=/root/go",
+		)
+
+		var stdoutBuf, stderrBuf strings.Builder
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+
+		if err := cmd.Start(); err != nil {
+			job.mu.Lock()
+			job.Status = "error"
+			job.Stderr = "Start failed: " + err.Error()
+			job.DoneAt = time.Now().Unix()
+			job.mu.Unlock()
+			return
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- cmd.Wait()
+		}()
+
+		timer := time.NewTimer(time.Duration(req.Timeout) * time.Second)
+		defer timer.Stop()
+
+		var cmdErr error
+		timedOut := false
+
+		select {
+		case cmdErr = <-done:
+		case <-timer.C:
+			timedOut = true
+			if cmd.Process != nil {
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					<-done
+				}
+			}
+		}
+
+		job.mu.Lock()
+		job.Stdout = stdoutBuf.String()
+		job.Stderr = stderrBuf.String()
+		job.DoneAt = time.Now().Unix()
+		job.TimedOut = timedOut
+		if timedOut {
+			job.ExitCode = 124
+			job.Status = "done"
+		} else if cmdErr != nil {
+			if exitErr, ok := cmdErr.(*exec.ExitError); ok {
+				job.ExitCode = exitErr.ExitCode()
+				job.Status = "done"
+			} else {
+				job.Status = "error"
+				job.Stderr += "\n" + cmdErr.Error()
+			}
+		} else {
+			job.Status = "done"
+		}
+		job.mu.Unlock()
+	}()
+
+	jsonOK(w, map[string]interface{}{
+		"job_id":  job.ID,
+		"status":  "running",
+		"command": req.Command,
+	})
+}
+
+// ── Job List ───────────────────────────────────────────────────────
+
+func handleJobs(w http.ResponseWriter, r *http.Request) {
+	var jobs []map[string]interface{}
+	jobStore.Range(func(key, value interface{}) bool {
+		job := value.(*Job)
+		job.mu.Lock()
+		jobs = append(jobs, map[string]interface{}{
+			"id":         job.ID,
+			"command":    truncate(job.Command, 80),
+			"status":     job.Status,
+			"exit_code":  job.ExitCode,
+			"timed_out":  job.TimedOut,
+			"started_at": job.StartedAt,
+			"done_at":    job.DoneAt,
+		})
+		job.mu.Unlock()
+		return true
+	})
+	if jobs == nil {
+		jobs = []map[string]interface{}{}
+	}
+	jsonOK(w, map[string]interface{}{"jobs": jobs, "count": len(jobs)})
+}
+
+// ── Job Detail ─────────────────────────────────────────────────────
+
+func handleJob(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID    string `json:"id"`
+		Clear bool   `json:"clear"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.ID == "" {
+		jsonError(w, 400, "id is required")
+		return
+	}
+
+	val, ok := jobStore.Load(req.ID)
+	if !ok {
+		jsonError(w, 404, "job not found: "+req.ID)
+		return
+	}
+	job := val.(*Job)
+
+	job.mu.Lock()
+	result := map[string]interface{}{
+		"id":         job.ID,
+		"command":    job.Command,
+		"dir":        job.Dir,
+		"status":     job.Status,
+		"stdout":     job.Stdout,
+		"stderr":     job.Stderr,
+		"exit_code":  job.ExitCode,
+		"timed_out":  job.TimedOut,
+		"started_at": job.StartedAt,
+		"done_at":    job.DoneAt,
+	}
+	status := job.Status
+	job.mu.Unlock()
+
+	if req.Clear && status != "running" {
+		jobStore.Delete(req.ID)
+	}
+
+	jsonOK(w, result)
+}
+
+// ── File Upload (base64) ───────────────────────────────────────────
+
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path    string `json:"path"`
+		Content string `json:"content"` // base64
+		Mode    int    `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.Path == "" || req.Content == "" {
+		jsonError(w, 400, "path and content (base64) are required")
+		return
+	}
+	if req.Mode == 0 {
+		req.Mode = 0644
+	}
+
+	data, err := base64.StdEncoding.DecodeString(req.Content)
+	if err != nil {
+		jsonError(w, 400, "Invalid base64: "+err.Error())
+		return
+	}
+
+	dir := filepath.Dir(req.Path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		jsonError(w, 500, "Failed to create directory: "+err.Error())
+		return
+	}
+
+	if err := os.WriteFile(req.Path, data, os.FileMode(req.Mode)); err != nil {
+		jsonError(w, 500, "Write failed: "+err.Error())
+		return
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"written": len(data),
+		"path":    req.Path,
+	})
+}
+
+// ── File Download (base64) ─────────────────────────────────────────
+
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.Path == "" {
+		jsonError(w, 400, "path is required")
+		return
+	}
+
+	data, err := os.ReadFile(req.Path)
+	if err != nil {
+		jsonError(w, 404, "Read failed: "+err.Error())
+		return
+	}
+	info, err := os.Stat(req.Path)
+	if err != nil {
+		jsonError(w, 500, "Stat failed: "+err.Error())
+		return
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"content": base64.StdEncoding.EncodeToString(data),
+		"size":    len(data),
+		"mode":    int(info.Mode()),
+		"path":    req.Path,
+	})
+}
+
+// ── Glob ───────────────────────────────────────────────────────────
 
 func handleGlob(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -520,6 +903,8 @@ func handleGlob(w http.ResponseWriter, r *http.Request) {
 
 	jsonOK(w, map[string]interface{}{"files": matches, "count": len(matches)})
 }
+
+// ── Grep ───────────────────────────────────────────────────────────
 
 func handleGrep(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -567,17 +952,11 @@ func handleGrep(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func jsonOK(w http.ResponseWriter, data map[string]interface{}) {
-	data["ok"] = true
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
+// ── Utilities ──────────────────────────────────────────────────────
 
-func jsonError(w http.ResponseWriter, code int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"ok":    false,
-		"error": message,
-	})
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
