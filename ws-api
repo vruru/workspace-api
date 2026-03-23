@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 ws-api - Remote workspace feels like local. Zero shell escaping issues.
-All data: json.dumps() -> HTTPS -> json.loads(), never through shell parsing.
+All data: json.dumps() -> HTTPS/WSS -> json.loads(), never through shell parsing.
+
+Transport: WSS (default, persistent connection) or HTTPS (fallback).
+  Set WS_TRANSPORT=http to force HTTPS mode.
 
 == Transparent exec (just prefix ws-api, like running locally) ==
   ws-api ls -la /root/workspace
@@ -63,11 +66,51 @@ import shlex
 import sys
 import urllib.request
 import urllib.error
+import uuid
 
 API_BASE = "https://hcwkapi.bygsoga.cc"
+WS_URL = "wss://hcwkapi.bygsoga.cc/ws"
 AUTH_TOKEN = "capy-workspace-7f3a9b2e"
 
-def api_call(endpoint, data):
+# Transport: "wss" (default) or "http"
+TRANSPORT = os.environ.get("WS_TRANSPORT", "wss").lower()
+
+# Singleton WebSocket connection for WSS mode
+_ws_conn = None
+
+def _get_ws():
+    """Get or create a persistent WebSocket connection."""
+    global _ws_conn
+    if _ws_conn is not None:
+        return _ws_conn
+    try:
+        import websocket
+        _ws_conn = websocket.create_connection(
+            f"{WS_URL}?token={AUTH_TOKEN}",
+            timeout=300,
+        )
+        return _ws_conn
+    except Exception:
+        return None
+
+def _ws_call(action, data):
+    """Send a request over WebSocket and return the response."""
+    ws = _get_ws()
+    if ws is None:
+        return None
+    msg_id = uuid.uuid4().hex[:12]
+    msg = {"id": msg_id, "action": action, "data": data}
+    try:
+        ws.send(json.dumps(msg))
+        resp = ws.recv()
+        return json.loads(resp)
+    except Exception:
+        global _ws_conn
+        _ws_conn = None
+        return None
+
+def _http_call(endpoint, data):
+    """Send a request over HTTPS and return the response."""
     url = f"{API_BASE}/api/{endpoint}"
     payload = json.dumps(data).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method="POST")
@@ -85,8 +128,18 @@ def api_call(endpoint, data):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+def api_call(endpoint, data):
+    """Unified API call: try WSS first (if enabled), fall back to HTTPS."""
+    if TRANSPORT == "wss":
+        result = _ws_call(endpoint, data)
+        if result is not None:
+            return result
+        # WSS failed, fall back to HTTPS silently
+    return _http_call(endpoint, data)
+
 def cmd_ping():
     r = api_call("ping", {})
+    r["transport"] = "wss" if (TRANSPORT == "wss" and _ws_conn is not None) else "https"
     print(json.dumps(r, indent=2))
 
 def cmd_read(args):
@@ -221,7 +274,6 @@ def cmd_edit(args):
     else:
         err = r.get('error', 'unknown')
         print(f"ERROR: {err}", file=sys.stderr)
-        # Smart hint: if old_string not found and was from positional args, warn about shell escaping
         if "not found" in err.lower() or "not unique" in err.lower():
             has_shell_chars = any(c in (old + new) for c in '$`!')
             from_positional = len(positional) >= 1
@@ -303,7 +355,6 @@ def cmd_patch(args):
         print("ERROR: pipe edits JSON via stdin", file=sys.stderr)
         print('  Example: echo \'[{"old":"x","new":"y"},{"old":"a","new":"b"}]\' | ws-api patch file', file=sys.stderr)
         sys.exit(1)
-    # Accept both array and object with "edits" key
     if isinstance(edits, list):
         edits_list = edits
     elif isinstance(edits, dict) and "edits" in edits:
@@ -311,7 +362,6 @@ def cmd_patch(args):
     else:
         print("ERROR: expected JSON array or {\"edits\":[...]}", file=sys.stderr)
         sys.exit(1)
-    # Normalize: accept "old"/"new" shorthand
     normalized = []
     for e in edits_list:
         normalized.append({
@@ -328,7 +378,6 @@ def cmd_patch(args):
 def _handle_exec_result(r):
     """Process exec result: print stdout to stdout, stderr to stderr, exit with code."""
     if r.get("ok"):
-        # Use separated stdout/stderr if available, fall back to combined
         if r.get("stdout") is not None:
             if r["stdout"]:
                 print(r["stdout"], end="", file=sys.stdout)
@@ -379,7 +428,6 @@ def _handle_exec_bg(data):
 
 def cmd_exec_transparent(all_args):
     """Transparent exec: join all args into a command, preserving quoting."""
-    # Check for --bg flag anywhere in args
     bg = False
     filtered = []
     timeout = None
@@ -415,7 +463,6 @@ def cmd_jobs(args):
             if j.get("timed_out"):
                 status = "timeout"
             eid = str(j.get("exit_code", "")) if status != "running" else ""
-            # Show live output size for running jobs
             if status == "running":
                 out_bytes = j.get("stdout_bytes", 0) + j.get("stderr_bytes", 0)
                 out_info = f"{out_bytes}B" if out_bytes > 0 else "-"
@@ -448,7 +495,6 @@ def cmd_job(args):
             print(f"Dir:     {r['dir']}")
         if status != "running":
             print(f"Exit:    {r.get('exit_code', '?')}")
-        # Print output
         stdout = r.get("stdout", "")
         stderr = r.get("stderr", "")
         if stdout:
@@ -523,7 +569,6 @@ def cmd_download(args):
     r = api_call("download", {"path": remote_path})
     if r.get("ok"):
         data = base64.b64decode(r["content"])
-        # Ensure local directory exists
         local_dir = os.path.dirname(local_path)
         if local_dir:
             os.makedirs(local_dir, exist_ok=True)
@@ -614,7 +659,6 @@ if __name__ == "__main__":
     if cmd in COMMANDS:
         COMMANDS[cmd](args)
     elif cmd.startswith("-"):
-        # Flag-like first arg = probably meant help
         print(__doc__)
         sys.exit(1)
     else:

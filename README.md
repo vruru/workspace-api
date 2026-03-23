@@ -1,19 +1,19 @@
 # workspace-api
 
-A lightweight, secure HTTP API that lets AI agents (and humans) operate on remote servers as if they were local — no SSH sessions, no shell escaping headaches.
+A lightweight, secure API that lets AI agents (and humans) operate on remote servers as if they were local — no SSH sessions, no shell escaping headaches.
 
 ## The Problem
 
 When AI coding agents (Claude, Cursor, Copilot, etc.) need to work on remote servers, they face painful limitations:
 
-- **Shell escaping hell**: Passing code snippets through SSH → bash → commands means quotes, backslashes, `$variables`, and special characters get mangled at every layer
+- **Shell escaping hell**: Passing code snippets through SSH -> bash -> commands means quotes, backslashes, `$variables`, and special characters get mangled at every layer
 - **No structured operations**: `sed` and `awk` are fragile for code editing — one wrong regex and your file is corrupted
 - **Lost context**: SSH sessions are stateless, commands run in isolation, and error handling is primitive
 - **Binary-unsafe output**: Command output goes through multiple encoding layers, often corrupting non-ASCII content
 
 ## The Solution
 
-**workspace-api** exposes your server's filesystem and shell through a clean JSON-over-HTTPS API. All content travels through `json.dumps()` → HTTPS → `json.loads()` — never through shell parsing.
+**workspace-api** exposes your server's filesystem and shell through a clean JSON API over **WSS (WebSocket Secure)** and **HTTPS**. All content travels through `json.dumps()` -> TLS -> `json.loads()` — never through shell parsing.
 
 The included `ws-api` CLI client makes remote operations feel exactly like local commands:
 
@@ -42,7 +42,43 @@ ws-api upload ./app /usr/local/bin/app --mode 0755
 ws-api download /var/log/app.log ./app.log
 ```
 
+## Architecture
+
+```
+                    WSS (default)
+┌─────────────┐  ═══════════════════  ┌──────────────────┐
+│  AI Agent    │      or HTTPS         │  workspace-api   │
+│  (sandbox)   │ ───────────────────► │  (your server)   │
+│              │ ◄─────────────────── │                  │
+│  ws-api CLI  │                       │  Go binary :19188│
+└─────────────┘                        └──────────────────┘
+                                              ▲
+                                       ┌──────┴──────┐
+                                       │    Caddy     │
+                                       │  (TLS proxy) │
+                                       │  :443 → :19188│
+                                       └──────────────┘
+```
+
+**Transport**: WSS is the default (persistent connection, lower overhead). HTTPS is the automatic fallback.
+**TLS**: Caddy handles automatic certificate provisioning and TLS termination.
+**Data flow**: content -> json.dumps() -> WSS/HTTPS -> json.loads() -> operation
+
 ## Features
+
+### Dual Transport: WSS + HTTPS
+
+The client uses **WSS (WebSocket Secure)** by default for lower latency and persistent connections. If WSS is unavailable, it falls back to **HTTPS** automatically.
+
+```bash
+# Default: WSS transport
+ws-api ping
+# {"ok": true, "pong": true, "transport": "wss"}
+
+# Force HTTPS mode
+WS_TRANSPORT=http ws-api ping
+# {"ok": true, "pong": true, "transport": "https"}
+```
 
 ### Transparent Command Execution
 Any unrecognized command is automatically forwarded to the remote server:
@@ -57,21 +93,15 @@ ws-api kubectl get pods      # just works
 - Special characters in output are perfectly preserved through JSON transport
 
 ### Background Execution
-Long-running commands can run in the background, freeing you to do other work while they complete:
+Long-running commands can run in the background:
 ```bash
-# Add --bg to any command to run it in the background
 ws-api go build ./... --bg                    # returns job ID immediately
-ws-api exec "make test" --bg                  # explicit exec, also works
-
-# Manage background jobs
-ws-api jobs                                   # list all jobs (ID, status, command)
+ws-api exec "make build" --bg                 # explicit exec, background
+ws-api jobs                                   # list all jobs
 ws-api job <id>                               # get job output (real-time if running)
-ws-api job <id> --clear                       # get output & remove job from list
-ws-api kill <id>                              # kill a running job
+ws-api job <id> --clear                       # get output & remove job
+ws-api kill <id>                              # kill a running bg job
 ```
-- Jobs persist on the server until cleared or the server restarts
-- `ws-api job <id>` shows live stdout/stderr even while the job is still running
-- Exit codes and timeout status are tracked per job
 
 ### File Operations
 ```bash
@@ -82,24 +112,20 @@ ws-api write <path> --file local_file.txt
 ```
 
 ### File Transfer (Binary-Safe)
-Transfer binary files (compiled binaries, images, archives, etc.) between local and remote using base64 encoding:
+Transfer binary files between local and remote using base64 encoding:
 ```bash
-# Upload local file to remote server
-ws-api upload ./v2board-api /www/wwwroot/xiaovb/v2board-api --mode 0755
-
-# Download remote file to local
+ws-api upload ./v2board-api /www/wwwroot/app/v2board-api --mode 0755
 ws-api download /root/backup.tar.gz ./backup.tar.gz
 ```
-- Binary-safe: content is base64-encoded in transit, decoded on arrival
-- `--mode` sets file permissions on upload (default: 0644)
-- Local directories are auto-created on download
-- Replaces the need for `scp` over SSH
 
 ### Text Editing (Find & Replace)
 Multiple input methods to avoid any escaping issues:
 ```bash
 # Inline (simple cases)
 ws-api edit <path> --old "old" --new "new" [--all]
+
+# Positional args
+ws-api edit <path> "old text" "new text"
 
 # From local files (complex content — zero escaping)
 ws-api edit <path> --old-file old.txt --new-file new.txt
@@ -109,7 +135,6 @@ echo '{"old":"match this","new":"replace with"}' | ws-api edit <path>
 
 # Preview changes without writing (dry-run)
 ws-api edit <path> --old "old" --new "new" --dry-run
-# Shows: match count, line numbers, size delta — no file modification
 ```
 
 ### Line-Based Editing
@@ -136,43 +161,22 @@ ws-api grep "TODO" [--glob "*.py"] [--context 3]
 ```
 
 ### Explicit Exec (with Options)
-When you need to pass extra options like working directory or timeout:
 ```bash
 ws-api exec "go test ./..." --dir /root/project --timeout 120
-ws-api exec "npm run build" --bg                 # background mode
+ws-api exec "npm run build" --bg
 ```
-- `--dir`: Set working directory for the command
-- `--timeout`: Override default timeout (seconds)
-- `--bg`: Run in background (see Background Execution above)
 
 ### Raw API Access
-Bypass the CLI and call any API endpoint directly with custom JSON:
 ```bash
 echo '{"path":"/root/workspace"}' | ws-api raw glob
 echo '{"command":"uname -a"}' | ws-api raw exec
 ```
-Useful for accessing endpoint features not yet wrapped by the CLI, or for scripting/automation.
-
-## Architecture
-
-```
-┌─────────────┐     HTTPS/JSON      ┌──────────────────┐
-│  AI Agent    │ ──────────────────► │  workspace-api   │
-│  (sandbox)   │                     │  (your server)   │
-│              │ ◄────────────────── │                  │
-│  ws-api CLI  │     JSON response   │  Go binary       │
-└─────────────┘                      └──────────────────┘
-
-Data flow: content → json.dumps() → HTTPS → json.loads() → operation
-                                                              │
-Result:   display ← json.loads() ← HTTPS ← json.dumps() ← result
-```
-
-Zero shell parsing at any point. Special characters, quotes, backslashes, unicode — all handled automatically by JSON serialization.
 
 ## Setup
 
-### Server (the machine you want to control)
+### Server
+
+The server listens on a single HTTP port (default 19188) and relies on **Caddy** for TLS termination.
 
 ```bash
 # Clone and build
@@ -180,23 +184,42 @@ git clone https://github.com/vruru/workspace-api.git
 cd workspace-api
 go build -o workspace-api .
 
-# Configure (optional — has sensible defaults)
-cat > /root/workspace/.env << 'ENVEOF'
-WS_DOMAIN=your-domain.example.com
-WS_AUTH_TOKEN=your-secret-token
-WS_CERT_DIR=/path/to/cert/cache
-ENVEOF
-
-# Run (auto-provisions TLS via Let's Encrypt)
-./workspace-api
+# Run
+WS_PORT=19188 WS_AUTH_TOKEN=your-secret-token ./workspace-api
 ```
 
-The server automatically:
-- Obtains and renews TLS certificates via Let's Encrypt
-- Listens on ports 80 (redirect) and 443 (API)
-- Authenticates all requests via Bearer token
+#### Caddy Configuration
 
-### Client (the AI agent's environment)
+```
+your-domain.example.com {
+    reverse_proxy localhost:19188
+}
+```
+
+Caddy automatically provisions TLS certificates and proxies both HTTPS and WSS traffic.
+
+#### Systemd Service
+
+```ini
+[Unit]
+Description=Workspace API (HTTP :19188, behind Caddy)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/path/to/workspace-api
+WorkingDirectory=/root/workspace
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+Environment=WS_PORT=19188
+Environment=WS_AUTH_TOKEN=your-secret-token
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Client
 
 Copy the `ws-api` Python script to your PATH:
 
@@ -205,41 +228,69 @@ cp ws-api /usr/local/bin/ws-api
 chmod +x /usr/local/bin/ws-api
 ```
 
-Edit the two constants at the top:
+Edit the constants at the top:
 ```python
 API_BASE = "https://your-domain.example.com"
+WS_URL = "wss://your-domain.example.com/ws"
 AUTH_TOKEN = "your-secret-token"
 ```
 
-Requirements: Python 3.6+ (uses only stdlib — no pip install needed).
+Requirements: Python 3.6+ with `websocket-client` (`pip install websocket-client`). Falls back to stdlib HTTPS if websocket-client is not installed.
 
 ## API Endpoints
+
+### HTTP Endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/exec` | POST | Execute shell commands (separated stdout/stderr) |
 | `/api/exec-bg` | POST | Execute command in background, returns job ID |
 | `/api/jobs` | POST | List all background jobs |
-| `/api/job` | POST | Get job status and output (real-time if running) |
+| `/api/job` | POST | Get job status and output |
 | `/api/job-kill` | POST | Kill a running background job |
-| `/api/read` | POST | Read file contents (with optional line numbers, offset, limit) |
-| `/api/write` | POST | Write/create files (auto-creates directories) |
-| `/api/upload` | POST | Upload binary file (base64 encoded) |
-| `/api/download` | POST | Download binary file (base64 encoded) |
-| `/api/edit` | POST | Find-and-replace text editing (supports dry-run) |
-| `/api/edit-lines` | POST | Line-number-based delete/insert/replace |
+| `/api/read` | POST | Read file contents |
+| `/api/write` | POST | Write/create files |
+| `/api/upload` | POST | Upload binary file (base64) |
+| `/api/download` | POST | Download binary file (base64) |
+| `/api/edit` | POST | Find-and-replace text editing |
+| `/api/edit-lines` | POST | Line-number-based editing |
 | `/api/patch` | POST | Atomic batch find-and-replace |
 | `/api/glob` | POST | Find files by pattern |
 | `/api/grep` | POST | Search file contents |
 | `/api/ping` | POST | Health check |
 
+### WebSocket Endpoint
+
+`/ws?token=your-secret-token`
+
+Message format:
+```json
+{
+  "id": "unique-request-id",
+  "action": "exec",
+  "data": {"command": "ls -la"}
+}
+```
+
+Response:
+```json
+{
+  "id": "unique-request-id",
+  "ok": true,
+  "stdout": "...",
+  "exit_code": 0
+}
+```
+
+Supported actions: all HTTP endpoint names (without `/api/` prefix), plus Bridge-compatible aliases (`terminal/exec`, `files/read`, `files/write`).
+
 ## Security Notes
 
-- All traffic is encrypted via TLS (auto-provisioned certificates)
-- Bearer token authentication on every request
+- All traffic is encrypted via TLS (Caddy auto-provisions certificates)
+- Bearer token authentication on every HTTP request
+- WebSocket authentication via query parameter token
 - The server runs commands as the server's user — scope access appropriately
 - Consider firewall rules to restrict which IPs can reach the API
-- The auth token should be strong and kept secret
 
 ## Why Not Just SSH?
 
@@ -250,14 +301,8 @@ Requirements: Python 3.6+ (uses only stdlib — no pip install needed).
 | Batch operations | Multiple round-trips | Single atomic request |
 | Error handling | Parse exit codes manually | Structured JSON responses |
 | Output fidelity | Encoding issues possible | JSON preserves everything |
-| AI agent friendly | Requires PTY hacks | Native HTTP/JSON |
-
-## Use Cases
-
-- **AI coding agents** operating on remote dev/build servers
-- **CI/CD pipelines** that need to edit config files on remote hosts
-- **Remote development** when you want local-feeling file operations
-- **Server automation** without the complexity of Ansible/Chef for simple tasks
+| AI agent friendly | Requires PTY hacks | Native WSS/HTTPS + JSON |
+| Transport | TCP (no auto-TLS) | WSS + HTTPS (auto-TLS via Caddy) |
 
 ## License
 
