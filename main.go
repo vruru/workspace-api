@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,13 +22,12 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/websocket"
 )
 
 var cfg struct {
-	Domain    string
+	Port      string
 	AuthToken string
-	CertDir   string
 }
 
 // ── Thread-Safe Buffer ─────────────────────────────────────────────
@@ -70,11 +69,9 @@ type Job struct {
 	StartedAt int64  `json:"started_at"`
 	DoneAt    int64  `json:"done_at,omitempty"`
 	mu        sync.Mutex
-	// Live output (only while running)
 	stdoutBuf *safeBuffer
 	stderrBuf *safeBuffer
-	// Process control
-	cancel context.CancelFunc
+	cancel    context.CancelFunc
 }
 
 var (
@@ -87,7 +84,6 @@ func genJobID() string {
 	return fmt.Sprintf("j%d_%04x", n, rand.Intn(0xFFFF))
 }
 
-// Clean up completed jobs older than 1 hour, runs every 5 minutes
 func jobCleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -138,15 +134,14 @@ func envOr(key, def string) string {
 func main() {
 	loadEnv("/root/workspace/.env")
 
-	cfg.Domain = envOr("WS_DOMAIN", "hcwkapi.bygsoga.cc")
+	cfg.Port = envOr("WS_PORT", "19188")
 	cfg.AuthToken = envOr("WS_AUTH_TOKEN", "capy-workspace-7f3a9b2e")
-	cfg.CertDir = envOr("WS_CERT_DIR", "/root/workspace/.certs")
 
-	// Start background job cleanup
 	go jobCleanupLoop()
 
 	mux := http.NewServeMux()
-	// Existing routes
+
+	// Existing REST API routes
 	mux.HandleFunc("/api/read", withAuth(handleRead))
 	mux.HandleFunc("/api/write", withAuth(handleWrite))
 	mux.HandleFunc("/api/edit", withAuth(handleEdit))
@@ -156,51 +151,28 @@ func main() {
 	mux.HandleFunc("/api/edit-lines", withAuth(handleEditLines))
 	mux.HandleFunc("/api/patch", withAuth(handlePatch))
 	mux.HandleFunc("/api/ping", handlePing)
-	// Job routes
 	mux.HandleFunc("/api/exec-bg", withAuth(handleExecBg))
 	mux.HandleFunc("/api/jobs", withAuth(handleJobs))
 	mux.HandleFunc("/api/job", withAuth(handleJob))
 	mux.HandleFunc("/api/job-kill", withAuth(handleJobKill))
-	// File transfer
 	mux.HandleFunc("/api/upload", withAuth(handleUpload))
 	mux.HandleFunc("/api/download", withAuth(handleDownload))
 
-	certManager := autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(cfg.Domain),
-		Cache:      autocert.DirCache(cfg.CertDir),
-	}
+	// WebSocket endpoint
+	mux.Handle("/ws", websocket.Handler(handleWS))
 
-	tlsSrv := &http.Server{
-		Addr:    ":443",
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			GetCertificate: certManager.GetCertificate,
-			MinVersion:     tls.VersionTLS12,
-		},
+	srv := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	httpSrv := &http.Server{
-		Addr:         ":80",
-		Handler:      certManager.HTTPHandler(http.HandlerFunc(redirectHTTPS)),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 300 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	go func() {
-		log.Printf("[workspace-api] HTTP :80 (ACME + redirect)")
-		if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("HTTP error: %v", err)
-		}
-	}()
-
-	go func() {
-		log.Printf("[workspace-api] HTTPS :443 (domain: %s)", cfg.Domain)
-		if err := tlsSrv.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
-			log.Fatalf("HTTPS error: %v", err)
+		log.Printf("[workspace-api] Listening on :%s (HTTP, behind Caddy for TLS)", cfg.Port)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
 		}
 	}()
 
@@ -210,15 +182,98 @@ func main() {
 	log.Println("[workspace-api] Shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	tlsSrv.Shutdown(ctx)
-	httpSrv.Shutdown(ctx)
+	srv.Shutdown(ctx)
+}
+
+// ── WebSocket ──────────────────────────────────────────────────────
+
+var wsHandlers = map[string]http.HandlerFunc{
+	// Native ws-api names
+	"read":       handleRead,
+	"write":      handleWrite,
+	"edit":       handleEdit,
+	"edit-lines": handleEditLines,
+	"patch":      handlePatch,
+	"exec":       handleExec,
+	"exec-bg":    handleExecBg,
+	"jobs":       handleJobs,
+	"job":        handleJob,
+	"job-kill":   handleJobKill,
+	"glob":       handleGlob,
+	"grep":       handleGrep,
+	"upload":     handleUpload,
+	"download":   handleDownload,
+	"ping": func(w http.ResponseWriter, r *http.Request) {
+		jsonOK(w, map[string]interface{}{"pong": true, "time": time.Now().Unix()})
+	},
+	// Bridge-compatible aliases
+	"terminal/exec": handleExec,
+	"files/read":    handleRead,
+	"files/write":   handleWrite,
+}
+
+func handleWS(ws *websocket.Conn) {
+	defer ws.Close()
+
+	// Auth via query param: /ws?token=xxx
+	token := ws.Request().URL.Query().Get("token")
+	if token != cfg.AuthToken {
+		websocket.JSON.Send(ws, map[string]interface{}{
+			"ok": false, "error": "unauthorized",
+		})
+		return
+	}
+
+	remoteAddr := ws.Request().RemoteAddr
+	log.Printf("[ws] Connected: %s", remoteAddr)
+
+	for {
+		var msg struct {
+			ID     string          `json:"id"`
+			Action string          `json:"action"`
+			Data   json.RawMessage `json:"data"`
+		}
+		if err := websocket.JSON.Receive(ws, &msg); err != nil {
+			log.Printf("[ws] Disconnected: %s (%v)", remoteAddr, err)
+			break
+		}
+
+		result := wsDispatch(msg.Action, msg.Data)
+		result["id"] = msg.ID
+
+		if err := websocket.JSON.Send(ws, result); err != nil {
+			log.Printf("[ws] Send error: %v", err)
+			break
+		}
+	}
+}
+
+func wsDispatch(action string, data json.RawMessage) map[string]interface{} {
+	handler, ok := wsHandlers[action]
+	if !ok {
+		return map[string]interface{}{"ok": false, "error": "unknown action: " + action}
+	}
+
+	// If data is null or empty, use empty JSON object
+	body := data
+	if len(body) == 0 || string(body) == "null" {
+		body = json.RawMessage(`{}`)
+	}
+
+	req, _ := http.NewRequest("POST", "/api/"+action, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		return map[string]interface{}{"ok": false, "error": "internal dispatch error: " + err.Error()}
+	}
+	return result
 }
 
 // ── HTTP Helpers ───────────────────────────────────────────────────
-
-func redirectHTTPS(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusMovedPermanently)
-}
 
 func withAuth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -379,7 +434,6 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find line numbers of all occurrences
 	var locations []int
 	searchFrom := 0
 	for {
@@ -392,7 +446,6 @@ func handleEdit(w http.ResponseWriter, r *http.Request) {
 		searchFrom += idx + len(req.OldString)
 	}
 
-	// Dry run: preview without writing, skip uniqueness check
 	if req.DryRun {
 		jsonOK(w, map[string]interface{}{
 			"dry_run":      true,
@@ -633,7 +686,6 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	case <-timer.C:
 		timedOut = true
 		exitCode = 124
-		// Graceful: SIGTERM to process group first
 		if cmd.Process != nil {
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 			select {
@@ -677,7 +729,6 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 		req.Timeout = 3600
 	}
 
-	// Context handles both timeout and manual kill
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Timeout)*time.Second)
 
 	stdoutBuf := &safeBuffer{}
@@ -696,7 +747,7 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 	jobStore.Store(job.ID, job)
 
 	go func() {
-		defer cancel() // release context resources
+		defer cancel()
 
 		cmd := exec.Command("bash", "-c", req.Command)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -709,7 +760,6 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 			"GOPATH=/root/go",
 		)
 
-		// Use safeBuffer for real-time output
 		cmd.Stdout = stdoutBuf
 		cmd.Stderr = stderrBuf
 
@@ -736,9 +786,7 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 
 		select {
 		case cmdErr = <-done:
-			// Normal completion
 		case <-ctx.Done():
-			// Either timeout or manual kill
 			if cmd.Process != nil {
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 				select {
@@ -755,13 +803,12 @@ func handleExecBg(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Finalize job
 		job.mu.Lock()
 		job.Stdout = stdoutBuf.String()
 		job.Stderr = stderrBuf.String()
 		job.DoneAt = time.Now().Unix()
 		job.TimedOut = timedOut
-		job.stdoutBuf = nil // release buffers
+		job.stdoutBuf = nil
 		job.stderrBuf = nil
 		job.cancel = nil
 
@@ -808,7 +855,6 @@ func handleJobs(w http.ResponseWriter, r *http.Request) {
 			"started_at": job.StartedAt,
 			"done_at":    job.DoneAt,
 		}
-		// Include live output size for running jobs
 		if job.Status == "running" && job.stdoutBuf != nil {
 			entry["stdout_bytes"] = job.stdoutBuf.Len()
 			entry["stderr_bytes"] = job.stderrBuf.Len()
@@ -857,7 +903,6 @@ func handleJob(w http.ResponseWriter, r *http.Request) {
 		"started_at": job.StartedAt,
 		"done_at":    job.DoneAt,
 	}
-	// Read from live buffers if running, else from finalized fields
 	if job.Status == "running" && job.stdoutBuf != nil {
 		result["stdout"] = job.stdoutBuf.String()
 		result["stderr"] = job.stderrBuf.String()
@@ -908,7 +953,7 @@ func handleJobKill(w http.ResponseWriter, r *http.Request) {
 	job.mu.Unlock()
 
 	if cancelFn != nil {
-		cancelFn() // triggers ctx.Done() in the goroutine
+		cancelFn()
 	}
 
 	jsonOK(w, map[string]interface{}{
